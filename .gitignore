@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Data & model cache
+backend/data/
+.cache/
+*.pkl
+
+# Logs (runtime output — not source)
+backend/logs/*.jsonl
+
+# Chroma persistent store
+chroma/
+
+# HuggingFace / sentence-transformers model cache
+~/.cache/huggingface/
+
+# Node (mcp-server)
+mcp-server/node_modules/
+mcp-server/dist/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+CLAUDE.md

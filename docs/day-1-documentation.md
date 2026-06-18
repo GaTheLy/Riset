@@ -200,4 +200,174 @@ fetch_papers(categories, query="", max_results=100, bootstrap_days=7)
 
 ---
 
-*Next: Component 2 — RSS Fetcher (`backend/ingestion/rss_fetcher.py`)*
+## Component 2 — RSS Fetcher
+
+**File:** `backend/ingestion/rss_fetcher.py`
+
+### What it does
+
+Fetches recent articles from four AI/ML news RSS feeds, extracts the full article text from each URL, deduplicates against previously seen articles, and returns a list of `Article` objects ready for chunking.
+
+### The four feeds
+
+| Feed | URL | Why included |
+|---|---|---|
+| Hugging Face Blog | `huggingface.co/blog/feed.xml` | Model releases, tutorials, real applied ML |
+| The Gradient | `thegradient.pub/rss/` | Long-form analysis — depth over news |
+| Google DeepMind | `deepmind.google/blog/rss.xml` | Frontier research announcements |
+| VentureBeat AI | `venturebeat.com/category/ai/feed/` | AI industry news and applied use cases |
+
+> **Feed swap during build:** Papers With Code (`paperswithcode.com/blog/feed`) was the original plan but permanently redirects to HuggingFace's trending page — the blog no longer exists. Replaced with Google DeepMind (always our 5th candidate). VentureBeat's original URL (`/ai/feed/`) returned 404; the correct AI category URL is `/category/ai/feed/`.
+
+### Two-step fetch process
+
+Unlike arXiv (one API call returns structured data), RSS fetching has two steps per article:
+
+```
+For each feed:
+    feedparser.parse(feed_url)
+         │
+         └─ List of entries: {title, link, summary, published}
+                  │
+                  └─ For each NEW entry (not in seen_urls):
+                           │
+                           ├─ random sleep 0.5–1.5s  ← rate limiting
+                           │
+                           ├─ trafilatura.fetch_url(url)
+                           │         └─ trafilatura.extract(html)
+                           │                   │
+                           │          ┌─────── ▼ ──────────┐
+                           │          │  text len >= 100?   │
+                           │          └──── yes ──── no ────┘
+                           │                 │         │
+                           │           "full_text"  fallback to
+                           │                         rss summary
+                           └─ Append Article to results
+```
+
+---
+
+### Design decisions
+
+#### Decision 1: RSS parsing library
+
+No real trade-off here. **`feedparser`** is the de facto standard — it handles both RSS and Atom formats, tolerates malformed feeds gracefully, and has been maintained since 2004. Any alternative would require significantly more code for no benefit.
+
+#### Decision 2: Article body extraction library
+
+The core decision. RSS entries only give a short summary; full article text requires fetching and cleaning each URL.
+
+| Library | Mechanism | Quality | Notes |
+|---|---|---|---|
+| **`trafilatura` (chosen)** | ML-trained extraction model | Best — leads benchmarks | Handles ad-heavy, complex layouts well |
+| `newspaper4k` | Heuristic rules | Good | Fork of unmaintained `newspaper3k`; uncertain longevity |
+| `readability-lxml` | Mozilla's Readability algorithm | Decent | Same as Firefox Reader Mode; lightweight but less accurate |
+
+**Why trafilatura matters here specifically:** VentureBeat is a commercial news site with heavy advertising and complex HTML. That's exactly where trafilatura's ML-based approach earns its edge over simpler heuristic libraries.
+
+#### Decision 3: Incremental fetching — why it's different from arXiv
+
+arXiv exposes a `submittedDate` query filter. RSS has no equivalent. The full feed is always returned (typically the last 10–50 items).
+
+| Option | Approach | Why rejected / chosen |
+|---|---|---|
+| A — Dedup only | Fetch full feed every time, skip seen URLs | **Chosen** — reliable, simple, negligible cost at 4 feeds |
+| B — Date filtering | Track `last_fetched_at`, skip items older than that | RSS `published` dates are unreliable — some feeds omit them or set them wrong |
+| C — HTTP conditional GET | Send `If-Modified-Since` / `ETag` headers; server returns 304 if unchanged | Correct production approach, but overkill at this scale |
+
+**Key insight:** Unlike arXiv where published date is authoritative, RSS `published` is set by each publisher individually and cannot be trusted for filtering. URL is the only reliable identity key.
+
+#### Decision 4: Extraction failure fallback
+
+`trafilatura` can return `None` for paywalled pages, JavaScript-rendered content, or HTTP errors.
+
+| Option | Behavior | Chosen? |
+|---|---|---|
+| Skip entirely | Article contributes nothing to knowledge base | Only if RSS summary is also empty |
+| **Fall back to RSS summary** | Short but real content; better than nothing | **Yes — primary fallback** |
+| Raise error | Stops the whole run | No — one bad URL shouldn't block all others |
+
+The `text_source` field on `Article` records which path was taken (`"full_text"` or `"rss_summary"`), so the JSONL log can surface how often fallbacks occur.
+
+#### Decision 5: Rate limiting
+
+Making one HTTP request per article without delay risks getting rate-limited or blocked by servers.
+
+| Option | Approach | Chosen? |
+|---|---|---|
+| No delay | Fastest; risks blocks | No |
+| Fixed delay (e.g. 0.5s) | Simple; predictable timing | No |
+| **Random delay 0.5–1.5s** | More human-like request pattern | **Yes** |
+
+Random delay is harder for servers to fingerprint as a bot. The `random.uniform(0.5, 1.5)` call runs before each article fetch (not before duplicates — those are skipped without a delay).
+
+---
+
+### Data structures
+
+**`Article` dataclass** — output type of this component:
+
+| Field | Type | Source |
+|---|---|---|
+| `title` | `str` | RSS `entry.title` |
+| `url` | `str` | RSS `entry.link` — also the deduplication key |
+| `published` | `datetime \| None` | RSS `entry.published_parsed` (may be `None`) |
+| `source` | `str` | Feed name, e.g. `"VentureBeat AI"` |
+| `text` | `str` | Full article text or RSS summary (fallback) |
+| `text_source` | `str` | `"full_text"` or `"rss_summary"` |
+
+**State file** (`backend/data/rss_state.json`):
+
+```json
+{
+  "last_fetched_at": "2026-06-18T06:30:00+00:00",
+  "seen_urls": [
+    "https://venturebeat.com/ai/...",
+    "https://huggingface.co/blog/..."
+  ]
+}
+```
+
+**JSONL log entry** (appended to `backend/logs/ingestion_YYYYMMDD.jsonl`):
+
+```json
+{
+  "timestamp": "2026-06-18T06:30:00+00:00",
+  "step": "rss_fetch",
+  "feeds": ["Hugging Face Blog", "The Gradient", "Google DeepMind", "VentureBeat AI"],
+  "fetched": 18,
+  "skipped_duplicates": 24,
+  "fallbacks_to_rss_summary": 2,
+  "latency_ms": 34201
+}
+```
+
+> **Note on latency:** RSS fetch latency is dominated by rate limiting delays, not network speed. At 0.5–1.5s per article, fetching 20 new articles takes 10–30 seconds. This is expected and intentional.
+
+---
+
+### Comparison: arXiv fetcher vs RSS fetcher
+
+| Concern | arXiv fetcher | RSS fetcher |
+|---|---|---|
+| Unique ID | `entry_id` (URL with version, e.g. `…v1`) | Article URL |
+| Date filtering | `submittedDate` API query | Not available — fetch full feed always |
+| Text content | Abstract only (from API) | Full article body (via trafilatura) |
+| Failure modes | API down, query too broad | Paywall, JS rendering, missing dates |
+| State overlap strategy | 1-day lookback | Not needed — URL dedup is sufficient |
+| Rate limiting | None (single API call) | 0.5–1.5s per article |
+
+---
+
+### Known limitations
+
+- **JavaScript-rendered pages:** `requests.get` makes plain HTTP requests. Pages that require a browser to render (React SPAs, etc.) return no content and fall back to RSS summary or are skipped. For our four feeds this is rare; VentureBeat used RSS summary fallback in practice.
+- **`MAX_ENTRIES_PER_FEED = 20` cap:** HuggingFace exposes its full post history (800+ entries). Without the cap, a first run would take ~15 minutes just on delays. The cap means older historical articles are never ingested. Acceptable trade-off for a weekly pipeline.
+- **Feed size vs. gap tolerance:** RSS feeds typically only expose the last 10–50 items. If the fetcher is down for several weeks, older articles fall off the feed and are permanently missed. No workaround without scraping pagination.
+- **`published` is unreliable:** Stored on `Article` for metadata but not used for filtering. Don't sort or filter by it — some feeds set it incorrectly or omit it.
+- **No logging shared with other components yet:** `_write_log()` is a local helper until the shared `StepLogger` is built.
+- **`trafilatura.fetch_url` has no timeout:** The original implementation used `trafilatura.fetch_url()` which can hang indefinitely on slow URLs. Replaced with `requests.get(timeout=10)` + `trafilatura.extract()` to keep each fetch bounded.
+
+---
+
+*Next: Component 3 — Chunker (`backend/ingestion/chunker.py`)*

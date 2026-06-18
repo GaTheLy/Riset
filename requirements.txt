@@ -1,1 +1,4 @@
 arxiv==4.0.0
+feedparser==6.0.12
+trafilatura==2.1.0
+requests==2.33.1
